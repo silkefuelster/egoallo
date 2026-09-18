@@ -14,6 +14,7 @@ from projectaria_tools.core.data_provider import create_vrs_data_provider
 from safetensors import safe_open
 from torch import Tensor
 
+from .data.aria_mps import compute_gravity_alignment_rotation
 from .network import EgoDenoiser, EgoDenoiserConfig
 from .tensor_dataclass import TensorDataclass
 from .transforms import SE3
@@ -130,6 +131,13 @@ class InferenceInputTransforms(TensorDataclass):
         device_calib = provider.get_device_calibration()
         T_device_cpf = device_calib.get_transform_device_cpf().to_matrix()
 
+        # Align to this trajectory's own measured gravity direction, so "+Z
+        # is up" holds regardless of the source data's world-frame
+        # convention. Same correction applied to the point cloud in
+        # load_point_cloud_and_find_ground.
+        T_correction = np.eye(4)
+        T_correction[:3, :3] = compute_gravity_alignment_rotation(slam_root_dir)
+
         # Get downsampled CPF frames.
         aria_fps = len(closed_loop_traj) / (
             closed_loop_traj[-1].tracking_timestamp.total_seconds()
@@ -141,7 +149,9 @@ class InferenceInputTransforms(TensorDataclass):
         Ts_world_cpf = []
         out_timestamps_secs = []
         for i in range(0, num_poses, int(aria_fps // fps)):
-            T_world_device = closed_loop_traj[i].transform_world_device.to_matrix()
+            T_world_device = (
+                T_correction @ closed_loop_traj[i].transform_world_device.to_matrix()
+            )
             assert T_world_device.shape == (4, 4)
             Ts_world_device.append(T_world_device)
             Ts_world_cpf.append(T_world_device @ T_device_cpf)

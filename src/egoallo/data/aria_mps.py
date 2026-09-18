@@ -6,6 +6,52 @@ from projectaria_tools.core import mps
 from projectaria_tools.core.mps.utils import filter_points_from_confidence
 
 
+def compute_gravity_alignment_rotation(slam_root_dir: Path) -> np.ndarray:
+    """Compute a rotation that aligns this trajectory's own measured gravity
+    direction to (0, 0, -1).
+
+    Aria MPS's closed-loop trajectory is only guaranteed to be in "an
+    arbitrary gravity aligned world coordinate frame" -- which axis ends up
+    "up" isn't fixed across capture pipelines/hardware. The rest of this
+    codebase (floor-height RANSAC below, and the network's canonicalization
+    in egoallo/network.py) hard-assumes +Z is up. Applying this rotation to
+    both the point cloud and every world-frame pose before anything else
+    touches them makes that assumption hold regardless of the source
+    convention, without needing to know it in advance -- for data that's
+    already Z-up this comes out ~identity.
+    """
+    closed_loop_path = slam_root_dir / "closed_loop_trajectory.csv"
+    if not closed_loop_path.exists():
+        closed_loop_path = slam_root_dir / "aria_trajectory.csv"
+    closed_loop_traj = mps.read_closed_loop_trajectory(str(closed_loop_path))  # type: ignore
+
+    a = np.mean([p.gravity_world for p in closed_loop_traj], axis=0)
+    a = a / np.linalg.norm(a)
+    b = np.array([0.0, 0.0, -1.0])
+
+    v = np.cross(a, b)
+    s = np.linalg.norm(v)
+    c = np.dot(a, b)
+    if s < 1e-8:
+        if c > 0:
+            return np.eye(3)
+        # 180-degree flip; any axis perpendicular to `a` works.
+        axis = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        axis = axis - a * np.dot(axis, a)
+        axis = axis / np.linalg.norm(axis)
+        return 2.0 * np.outer(axis, axis) - np.eye(3)
+
+    vx = np.array(
+        [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]]
+    )
+    R = np.eye(3) + vx + vx @ vx * ((1.0 - c) / (s * s))
+    angle_deg = np.degrees(np.arccos(np.clip(c, -1.0, 1.0)))
+    print(
+        f"Gravity alignment: measured direction {a}, correcting by {angle_deg:.1f} degrees"
+    )
+    return R
+
+
 def load_point_cloud_and_find_ground(
     points_path: Path,
     return_points: Literal["all", "filtered", "less_filtered"] = "less_filtered",
@@ -65,6 +111,12 @@ def load_point_cloud_and_find_ground(
 
     assert filtered_points_data.shape == (filtered_points_data.shape[0], 3)
 
+    # Align to this trajectory's own measured gravity direction before doing
+    # anything Z-height-based below.
+    R_gravity = compute_gravity_alignment_rotation(points_path.parent)
+    filtered_points_data = filtered_points_data @ R_gravity.T
+    less_filtered_points_data = less_filtered_points_data @ R_gravity.T
+
     # RANSAC floor plane.
     # We consider points in the lowest 10% of the point cloud.
     filtered_zs = filtered_points_data[:, 2]
@@ -114,4 +166,7 @@ def load_point_cloud_and_find_ground(
         return less_filtered_points_data, floor_z
     else:
         assert points_data is not None
-        return np.array([x.position_world for x in points_data]), floor_z
+        return (
+            np.array([x.position_world for x in points_data]) @ R_gravity.T,
+            floor_z,
+        )

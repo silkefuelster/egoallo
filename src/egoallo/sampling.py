@@ -69,6 +69,7 @@ def run_sampling_with_stitching(
     num_samples: int,
     device: torch.device,
     guidance_verbose: bool = True,
+    eta: float = 0.8,
 ) -> network.EgoDenoiseTraj:
     # Offset the T_world_cpf transform to place the floor at z=0 for the
     # denoiser network. All of the network outputs are local, so we don't need to
@@ -80,7 +81,6 @@ def run_sampling_with_stitching(
         device=device
     )
     alpha_bar_t = noise_constants.alpha_bar_t
-    alpha_t = noise_constants.alpha_t
 
     T_cpf_tm1_cpf_t = (
         SE3(Ts_world_cpf[..., :-1, :]).inverse() @ SE3(Ts_world_cpf[..., 1:, :])
@@ -96,7 +96,6 @@ def run_sampling_with_stitching(
         )
     ]
     ts = quadratic_ts()
-
     seq_len = x_t_packed.shape[1]
 
     start_time = None
@@ -166,15 +165,18 @@ def run_sampling_with_stitching(
 
         if torch.any(torch.isnan(x_0_packed_pred)):
             print("found nan", i)
-        sigma_t = torch.cat(
-            [
-                torch.zeros((1,), device=device),
-                torch.sqrt(
-                    (1.0 - alpha_bar_t[:-1]) / (1 - alpha_bar_t[1:]) * (1 - alpha_t)
-                )
-                * 0.8,
-            ]
-        )
+
+        # Skip-aware DDIM sigma, computed for the actual (t, t_next) gap so that
+        # sigma_t_i**2 <= 1 - alpha_bar_t[t_next] holds for any eta in [0, 1],
+        # regardless of step count / schedule spacing.
+        if t == 0:
+            sigma_t_i = torch.zeros((), device=device)
+        else:
+            sigma_t_i = eta * torch.sqrt(
+                (1 - alpha_bar_t[t_next])
+                / (1 - alpha_bar_t[t])
+                * (1 - alpha_bar_t[t] / alpha_bar_t[t_next])
+            )
 
         if guidance_mode != "off" and guidance_inner:
             x_0_pred, _ = do_guidance_optimization(
@@ -196,15 +198,14 @@ def run_sampling_with_stitching(
         if start_time is None:
             start_time = time.time()
 
-        # print(sigma_t)
         x_t_packed = (
             torch.sqrt(alpha_bar_t[t_next]) * x_0_packed_pred
             + (
-                torch.sqrt(1 - alpha_bar_t[t_next] - sigma_t[t] ** 2)
+                torch.sqrt(1 - alpha_bar_t[t_next] - sigma_t_i ** 2)
                 * (x_t_packed - torch.sqrt(alpha_bar_t[t]) * x_0_packed_pred)
                 / torch.sqrt(1 - alpha_bar_t[t] + 1e-1)
             )
-            + sigma_t[t] * torch.randn(x_0_packed_pred.shape, device=device)
+            + sigma_t_i * torch.randn(x_0_packed_pred.shape, device=device)
         )
         x_t_list.append(
             network.EgoDenoiseTraj.unpack(

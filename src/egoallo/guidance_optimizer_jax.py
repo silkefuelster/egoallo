@@ -146,6 +146,9 @@ def _optimize_vmapped(
 
 # Modes for guidance.
 GuidanceMode = Literal[
+    # No guidance optimizer at all (e.g. when the denoiser is conditioned on
+    # observed wrist poses directly).
+    "off",
     # Foot skating only.
     "no_hands",
     # Only use Aria wrist pose.

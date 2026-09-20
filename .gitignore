@@ -19,3 +19,9 @@ outputs/
 data/
 egoallo_checkpoint_*
 egoallo_example_*
+
+# First-party: wrist-pose conditioning fine-tune checkpoints. Too large for
+# git (each model.safetensors exceeds GitHub's 100MB file limit) -- archived
+# externally instead, see README.
+wristcond_ckpt*/
+wristcond_lora*/

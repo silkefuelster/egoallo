@@ -70,6 +70,10 @@ def run_sampling_with_stitching(
     device: torch.device,
     guidance_verbose: bool = True,
     eta: float = 0.8,
+    # First-party: observed per-hand wrist pose + validity, CPF frame, one row
+    # per denoised frame (aligned with `Ts_world_cpf[1:]`). Fed to the denoiser
+    # when it was trained with `include_wrist_pose_cond=True`.
+    hand_cond: Float[Tensor, "time 20"] | None = None,
 ) -> network.EgoDenoiseTraj:
     # Offset the T_world_cpf transform to place the floor at z=0 for the
     # denoiser network. All of the network outputs are local, so we don't need to
@@ -90,6 +94,9 @@ def run_sampling_with_stitching(
         (num_samples, Ts_world_cpf.shape[0] - 1, denoiser_network.get_d_state()),
         device=device,
     )
+    if hand_cond is not None:
+        assert hand_cond.shape == (Ts_world_cpf.shape[0] - 1, 20), hand_cond.shape
+        hand_cond = hand_cond.to(device)
     x_t_list = [
         network.EgoDenoiseTraj.unpack(
             x_t_packed, include_hands=denoiser_network.config.include_hands
@@ -148,7 +155,14 @@ def run_sampling_with_stitching(
                             None, start_t + 1 : end_t + 1, :
                         ].repeat((num_samples, 1, 1)),
                         project_output_rotmats=False,
-                        hand_positions_wrt_cpf=None,  # TODO: this should be filled in!!
+                        hand_positions_wrt_cpf=None,
+                        hand_cond=(
+                            None
+                            if hand_cond is None
+                            else hand_cond[None, start_t:end_t, :].repeat(
+                                (num_samples, 1, 1)
+                            )
+                        ),
                         mask=None,
                     )
                     * overlap_weights_slice

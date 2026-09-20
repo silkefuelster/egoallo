@@ -1,6 +1,7 @@
 """Training loss configuration."""
 
 import dataclasses
+from pathlib import Path
 from typing import Literal
 
 import torch.utils.data
@@ -9,10 +10,11 @@ from torch import Tensor
 from torch._dynamo import OptimizedModule
 from torch.nn.parallel import DistributedDataParallel
 
-from . import network
+from . import fncsmpl, network
 from .data.amass import EgoTrainingData
+from .hand_cond import assemble_hand_cond, fov_visibility_mask
 from .sampling import CosineNoiseScheduleConstants
-from .transforms import SO3
+from .transforms import SE3, SO3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,18 +33,83 @@ class TrainingLossConfig:
     weight_loss_by_t: Literal["emulate_eps_pred"] = "emulate_eps_pred"
     """Weights to apply to the loss at each noise level."""
 
+    # --- Wrist-pose conditioning: how observed hands are simulated at train time. ---
+    # (Only used when the model has `include_wrist_pose_cond=True`.)
+    wrist_cond_fov_half_deg: float = 55.0
+    """Half-angle of the CPF forward cone a wrist must fall in to count as "observed"."""
+    wrist_cond_fov_pitch_deg: float = 0.0
+    """Downward pitch of that cone, to approximate the Aria RGB camera mounting."""
+    wrist_cond_fov_max_range_m: float = 1.25
+    """Max wrist distance from the CPF to count as "observed"."""
+    wrist_cond_seq_dropout_prob: float = 0.05
+    """Probability an entire sequence gets no wrist conditioning at all (keeps the
+    model able to run with no hand tracking at inference)."""
+    wrist_cond_frame_dropout_prob: float = 0.02
+    """Per-hand, per-frame probability an otherwise-visible wrist is dropped.
+    Kept low on purpose: within a tracked sequence we want the model to treat a
+    visible wrist as near-non-negotiable."""
+    wrist_cond_pos_noise_std: float = 0.02
+    """Std (metres) of Gaussian noise added to observed wrist positions."""
+    wrist_cond_rot_noise_deg: float = 12.0
+    """Std (degrees) of random rotation noise added to observed wrist orientations."""
+    wrist_cond_pos_loss_weight: float = 5.0
+    """Weight on an explicit loss (via SMPL-H FK on the predicted body) between
+    the predicted wrist positions and the *conditioned* wrist positions, on
+    observed frames. Forces the model to use the signal. 0 disables it.
+    TUNE: too high -> nails wrist position but picks crossed / contorted arm
+    configs (body_rotmats MSE gets drowned out); too low -> ignores the signal
+    (T-pose). Watch `loss_term/wrist_cond_pos` vs `loss_term/body_rotmats`."""
+    wrist_cond_pos_loss_clamp: float = 0.04
+    """Per-coordinate squared-error cap (m^2; 0.04 = 20 cm) on the wrist-position
+    loss, so one bad-pose sample can't spike the gradient (fp16 stability)."""
+    wrist_cond_pos_loss_uniform_t: bool = True
+    """Weight the wrist-position loss uniformly over diffusion timesteps instead
+    of by `weight_t` (which down-weights high noise). High-t is where x_t is
+    near-pure noise and the model must rely on the conditioning, so that's where
+    we most want to train 'conditioning -> wrist position'."""
+
+    # --- CPF conditioning corruption ---------------------------------------------
+    # On AMASS the released model can already infer arm pose from head/CPF motion
+    # (it's overfit + head motion correlates with arm swing for locomotion), so
+    # it never has to use `hand_cond`. Corrupting the CPF motion signal at train
+    # time removes that crutch: with unreliable head motion, minimizing the loss
+    # requires leaning on the wrist conditioning. The signal is clean at inference
+    # (real Aria SLAM), so this is train-only regularization.
+    cpf_cond_noise_rot_deg: float = 2.0
+    """Std (deg) of rotation noise on the per-frame relative CPF transform
+    (T_cpf_tm1_cpf_t). Kept mild -- and scaled by (1 - alpha_bar_t), so low-noise
+    diffusion steps (where the pose is already in x_t) see ~no corruption and
+    only high-noise steps (where the model generates from conditioning) get the
+    full amount. 0 disables CPF corruption."""
+    cpf_cond_noise_trans_m: float = 0.01
+    """Std (m) of translation noise on the relative CPF transform."""
+    cpf_cond_noise_heavy_prob: float = 0.05
+    """Per-sequence probability of applying `cpf_cond_noise_heavy_scale`x the
+    noise (simulates a stretch of bad head tracking -> lean on hand_cond)."""
+    cpf_cond_noise_heavy_scale: float = 3.0
+
 
 class TrainingLossComputer:
     """Helper class for computing the training loss. Contains a single method
     for computing a training loss."""
 
-    def __init__(self, config: TrainingLossConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        config: TrainingLossConfig,
+        device: torch.device,
+        smplh_npz_path: Path | None = None,
+    ) -> None:
         self.config = config
         self.noise_constants = (
             CosineNoiseScheduleConstants.compute(timesteps=1000)
             .to(device)
             .map(lambda tensor: tensor.to(torch.float32))
         )
+
+        # SMPL-H body model, only loaded if we need the wrist-position loss.
+        self.body_model: fncsmpl.SmplhModel | None = None
+        if config.wrist_cond_pos_loss_weight > 0.0 and smplh_npz_path is not None:
+            self.body_model = fncsmpl.SmplhModel.load(smplh_npz_path).to(device)
 
         # Emulate loss weight that would be ~equivalent to epsilon prediction.
         #
@@ -127,13 +194,102 @@ class TrainingLossComputer:
                 0.0,
             )
 
+        # First-party: assemble the observed wrist-pose conditioning, simulating
+        # which hands the ego camera would actually see (FOV gate), detector
+        # misses (dropout), and estimator error (noise).
+        hand_cond: Tensor | None = None
+        wrist_cond_valid: Tensor | None = None  # (b, t, 2) bool, kept for the wrist loss
+        if getattr(unwrapped_model.config, "include_wrist_pose_cond", False):
+            cfg = self.config
+            wrist_pos = train_batch.wrist_pos_wrt_cpf  # (b, t, 2, 3)
+            wrist_rot = train_batch.wrist_rot_wrt_cpf  # (b, t, 2, 3, 3)
+            palm_pos = train_batch.palm_pos_wrt_cpf  # (b, t, 2, 3)
+            palm_normal = train_batch.palm_normal_wrt_cpf  # (b, t, 2, 3)
+
+            visible = fov_visibility_mask(
+                wrist_pos,
+                half_fov_deg=cfg.wrist_cond_fov_half_deg,
+                pitch_deg=cfg.wrist_cond_fov_pitch_deg,
+                max_range_m=cfg.wrist_cond_fov_max_range_m,
+            )  # (b, t, 2)
+            frame_keep = (
+                torch.rand((batch, time, 2), device=device)
+                > cfg.wrist_cond_frame_dropout_prob
+            )
+            seq_keep = (
+                torch.rand((batch, 1, 1), device=device)
+                > cfg.wrist_cond_seq_dropout_prob
+            )
+            valid = visible & frame_keep & seq_keep  # (b, t, 2)
+            wrist_cond_valid = valid
+
+            enc = getattr(
+                unwrapped_model.config, "wrist_cond_encoding", "palm_raw"
+            )
+            wrist_pos = wrist_pos + torch.randn_like(wrist_pos) * (
+                cfg.wrist_cond_pos_noise_std
+            )
+            palm_pos = palm_pos + torch.randn_like(palm_pos) * (
+                cfg.wrist_cond_pos_noise_std
+            )
+            # Small random rotation to mimic Aria estimator error (the measured
+            # train/inference disagreement on the palm normal is ~11 deg after the
+            # left-hand sign fix -- see verify_palm_normal.py).
+            rot_noise = SO3.exp(
+                torch.randn((batch, time, 2, 3), device=device)
+                * (cfg.wrist_cond_rot_noise_deg * torch.pi / 180.0)
+            ).as_matrix()  # (b, t, 2, 3, 3)
+            if enc == "rot6d":
+                wrist_rot = torch.einsum("...ij,...jk->...ik", wrist_rot, rot_noise)
+            else:  # palm_raw: jitter the palm-normal direction
+                palm_normal = torch.einsum("...ij,...j->...i", rot_noise, palm_normal)
+
+            hand_cond = assemble_hand_cond(
+                valid=valid,
+                wrist_pos_cpf=wrist_pos,
+                wrist_rot_cpf=wrist_rot,
+                palm_pos_cpf=palm_pos,
+                palm_normal_cpf=palm_normal,
+                encoding=enc,
+            )  # (b, t, 20)
+
+        # First-party: corrupt the CPF motion signal so the model can't infer arm
+        # pose from head motion alone and must lean on `hand_cond`. Train-only:
+        # the FK wrist loss and root recovery still use the clean `train_batch`.
+        T_cpf_tm1_cpf_t_in = train_batch.T_cpf_tm1_cpf_t
+        _c = self.config
+        if (
+            getattr(unwrapped_model.config, "include_wrist_pose_cond", False)
+            and (_c.cpf_cond_noise_rot_deg > 0.0 or _c.cpf_cond_noise_trans_m > 0.0)
+        ):
+            heavy = (
+                torch.rand((batch, 1, 1), device=device)
+                < _c.cpf_cond_noise_heavy_prob
+            ).to(T_cpf_tm1_cpf_t_in.dtype)
+            # more corruption when the model relies on conditioning (high noise):
+            # (1 - alpha_bar_t) is ~0 at low t, ~1 at high t.
+            scale = (1.0 + heavy * (_c.cpf_cond_noise_heavy_scale - 1.0)) * (
+                1.0 - alpha_bar_t
+            )  # (b,1,1)
+            rot_n = torch.randn((batch, time, 3), device=device) * (
+                _c.cpf_cond_noise_rot_deg * torch.pi / 180.0
+            ) * scale
+            trans_n = (
+                torch.randn((batch, time, 3), device=device)
+                * _c.cpf_cond_noise_trans_m
+                * scale
+            )
+            noise = SE3.from_rotation_and_translation(SO3.exp(rot_n), trans_n)
+            T_cpf_tm1_cpf_t_in = (SE3(T_cpf_tm1_cpf_t_in) @ noise).parameters()
+
         # Denoise.
         x_0_packed_pred = model.forward(
             x_t_packed=x_t_packed,
             t=t,
             T_world_cpf=train_batch.T_world_cpf,
-            T_cpf_tm1_cpf_t=train_batch.T_cpf_tm1_cpf_t,
+            T_cpf_tm1_cpf_t=T_cpf_tm1_cpf_t_in,
             hand_positions_wrt_cpf=hand_positions_wrt_cpf,
+            hand_cond=hand_cond,
             project_output_rotmats=False,
             mask=train_batch.mask,
             cond_dropout_keep_mask=torch.rand((batch,), device=device)
@@ -250,6 +406,51 @@ class TrainingLossComputer:
         loss = sum([loss_terms[k] * self.config.loss_weights[k] for k in loss_terms])
         assert isinstance(loss, Tensor)
         assert loss.shape == ()
+
+        # First-party: explicit wrist-position loss. Run SMPL-H FK on the
+        # predicted body and penalise the predicted wrists deviating from the
+        # *conditioned* wrist positions, on observed frames -- this is what forces
+        # the model to treat a visible wrist as a hard target, not an optional
+        # hint. Target is the clean GT (the conditioning it saw was a noisy
+        # version, so the best it can do is trust it).
+        if (
+            self.body_model is not None
+            and wrist_cond_valid is not None
+            and self.config.wrist_cond_pos_loss_weight > 0.0
+        ):
+            shaped = self.body_model.with_shape(train_batch.betas)  # batch (b, 1)
+            body_quats_pred = SO3.from_matrix(x_0_pred.body_rotmats).wxyz  # (b,t,21,4)
+            posed = shaped.with_pose_decomposed(
+                T_world_root=train_batch.T_world_root,
+                body_quats=body_quats_pred,
+            )
+            wrist_w = posed.Ts_world_joint[:, :, [19, 20], 4:7]  # (b,t,2,3)
+            wrist_pred_cpf = (
+                SE3(train_batch.T_world_cpf[:, :, None, :]).inverse() @ wrist_w
+            )  # (b,t,2,3)
+
+            w = wrist_cond_valid.to(wrist_pred_cpf.dtype)[..., None]  # (b,t,2,1)
+            se = ((wrist_pred_cpf - train_batch.wrist_pos_wrt_cpf) ** 2).clamp(
+                max=self.config.wrist_cond_pos_loss_clamp
+            ) * w
+            per_bt = se.sum(dim=(-1, -2))  # (b,t)
+            denom = (
+                (w.sum(dim=(-1, -2)) * train_batch.mask).sum().clamp_min(256.0)
+            )
+            # `weight_t` down-weights high-noise timesteps -- but those are exactly
+            # where the model has only the conditioning to go on, so for the wrist
+            # objective we weight uniformly across t (see wrist_cond_pos_loss_uniform_t).
+            wt = (
+                torch.ones_like(weight_t)
+                if self.config.wrist_cond_pos_loss_uniform_t
+                else weight_t
+            )
+            wrist_pos_loss = (
+                per_bt * train_batch.mask * wt[:, None]
+            ).sum() / denom
+            log_outputs["loss_term/wrist_cond_pos"] = wrist_pos_loss
+            loss = loss + self.config.wrist_cond_pos_loss_weight * wrist_pos_loss
+
         log_outputs["train_loss"] = loss
 
         return loss, log_outputs

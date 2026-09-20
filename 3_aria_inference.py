@@ -12,6 +12,7 @@ import yaml
 from egoallo import fncsmpl, fncsmpl_extensions
 from egoallo.data.aria_mps import load_point_cloud_and_find_ground
 from egoallo.guidance_optimizer_jax import GuidanceMode
+from egoallo.hand_cond import hand_cond_from_detections
 from egoallo.hand_detection_structs import (
     CorrespondedAriaHandWristPoseDetections,
     CorrespondedHamerDetections,
@@ -131,6 +132,24 @@ def main(args: Args) -> None:
     denoiser_network = load_denoiser(args.checkpoint_dir).to(device)
     body_model = fncsmpl.SmplhModel.load(args.smplh_npz_path).to(device)
 
+    # First-party: if the denoiser was trained with wrist-pose conditioning,
+    # build that signal from the Aria / HaMeR detections (aligned with the
+    # denoised frames, i.e. Ts_world_cpf[1:]).
+    hand_cond = None
+    if getattr(denoiser_network.config, "include_wrist_pose_cond", False):
+        hand_cond = hand_cond_from_detections(
+            Ts_world_cpf=Ts_world_cpf[1:].to(device),
+            aria_detections=aria_detections,
+            hamer_detections=hamer_detections,
+            encoding=getattr(
+                denoiser_network.config, "wrist_cond_encoding", "rot6d"
+            ),
+        )
+        print(
+            f"Built wrist-pose conditioning: "
+            f"{int(hand_cond.reshape(-1, 2, 10)[..., 0].sum())} hand-frames observed."
+        )
+
     traj = run_sampling_with_stitching(
         denoiser_network,
         body_model=body_model,
@@ -143,6 +162,7 @@ def main(args: Args) -> None:
         num_samples=args.num_samples,
         device=device,
         floor_z=floor_z,
+        hand_cond=hand_cond,
     )
 
     # Save outputs in case we want to visualize later.

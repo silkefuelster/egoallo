@@ -49,6 +49,11 @@ class EgoAlloTrainConfig:
     warmup_steps: int = 1000
     max_grad_norm: float = 1.0
 
+    # Stop after this many steps (the loop is otherwise infinite). None = run forever.
+    num_train_steps: int | None = None
+    # SMPL-H model, used by the wrist-position loss (see TrainingLossConfig).
+    smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz")
+
 
 def get_experiment_dir(experiment_name: str, version: int = 0) -> Path:
     """Creates a directory to put experiment files in, suffixed with a version
@@ -65,10 +70,72 @@ def get_experiment_dir(experiment_name: str, version: int = 0) -> Path:
         return experiment_dir
 
 
+def _load_model_weights_column_preserving(
+    model: "network.EgoDenoiser", checkpoint_dir: Path
+) -> None:
+    """Load `model.safetensors` from a released checkpoint into `model`, tolerating
+    a widened conditioning input.
+
+    `latent_from_cond.weight` grows from ``[d_latent, d_cond_old]`` to
+    ``[d_latent, d_cond_new]`` when a conditioning stream is added (e.g.
+    `include_wrist_pose_cond`). We copy the pretrained columns and zero the new
+    ones, so at step 0 the model reproduces the released checkpoint exactly and
+    then learns to use the new channel. A fresh optimizer is used (we do not call
+    `accelerator.load_state`), so pass this instead of `--restore-checkpoint-dir`.
+    """
+    from safetensors import safe_open
+
+    st_path = checkpoint_dir / "model.safetensors"
+    with safe_open(str(st_path), framework="pt") as f:
+        pretrained = {k: f.get_tensor(k) for k in f.keys()}
+
+    to_load: dict[str, "torch.Tensor"] = {}
+    for k, v_own in model.state_dict().items():
+        src = k
+        if k not in pretrained and ".base." in k:
+            # LoRA-wrapped layer: the released checkpoint stored it unwrapped.
+            src = k.replace(".base.", ".")
+        if src not in pretrained:
+            if "lora_A" not in k and "lora_B" not in k:
+                logger.warning(f"[restore-model-only] {k}: no pretrained tensor, keeping init")
+            continue
+        v_pre = pretrained[src]
+        if v_pre.shape == v_own.shape:
+            to_load[k] = v_pre
+        elif (
+            k == "latent_from_cond.weight"
+            and v_pre.ndim == v_own.ndim == 2
+            and v_pre.shape[0] == v_own.shape[0]
+            and v_pre.shape[1] < v_own.shape[1]
+        ):
+            merged = torch.zeros_like(v_own)
+            merged[:, : v_pre.shape[1]] = v_pre
+            to_load[k] = merged
+            logger.info(
+                f"[restore-model-only] {k}: copied {v_pre.shape[1]} cols, "
+                f"zeroed {v_own.shape[1] - v_pre.shape[1]}"
+            )
+        else:
+            logger.warning(
+                f"[restore-model-only] {k}: shape mismatch "
+                f"{tuple(v_pre.shape)} vs {tuple(v_own.shape)}, keeping init"
+            )
+    missing, unexpected = model.load_state_dict(to_load, strict=False)
+    logger.info(
+        f"[restore-model-only] loaded {len(to_load)} tensors from {st_path}; "
+        f"{len(missing)} kept-init, {len(unexpected)} unexpected"
+    )
+
+
 def run_training(
     config: EgoAlloTrainConfig,
     restore_checkpoint_dir: Path | None = None,
+    restore_model_only: Path | None = None,
 ) -> None:
+    assert not (restore_checkpoint_dir is not None and restore_model_only is not None), (
+        "Pass at most one of --restore-checkpoint-dir (full accelerate state) or "
+        "--restore-model-only (weights only, fresh optimizer)."
+    )
     # Set up experiment directory + HF accelerate.
     # We're getting to manage logging, checkpoint directories, etc manually,
     # and just use `accelerate` for distibuted training.
@@ -111,6 +178,24 @@ def run_training(
 
     # Setup.
     model = network.EgoDenoiser(config.model)
+    if restore_model_only is not None:
+        _load_model_weights_column_preserving(model, restore_model_only)
+
+    # LoRA: freeze the pretrained backbone; train only the LoRA adapters and the
+    # hand-conditioning MLP. Forces the wrist signal to be learned through the
+    # low-rank adaptation instead of being drowned out by the CPF backbone.
+    if config.model.lora_rank > 0:
+        for name, p in model.named_parameters():
+            p.requires_grad_(
+                ("lora_A" in name) or ("lora_B" in name) or ("hand_cond_proj" in name)
+            )
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in model.parameters())
+        logger.info(
+            f"[lora] rank={config.model.lora_rank} targets={config.model.lora_targets}"
+            f" -> trainable {n_train:,} / {n_total:,} ({100 * n_train / n_total:.1f}%)"
+        )
+
     train_loader = torch.utils.data.DataLoader(
         dataset=EgoAmassHdf5Dataset(
             config.dataset_hdf5_path,
@@ -130,7 +215,7 @@ def run_training(
         drop_last=True,
     )
     optim = torch.optim.AdamW(  # type: ignore
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -163,13 +248,24 @@ def run_training(
     accelerator.save_state(str(experiment_dir / f"checkpoints_{step}"))
 
     # Run training loop!
-    loss_helper = training_loss.TrainingLossComputer(config.loss, device=device)
+    loss_helper = training_loss.TrainingLossComputer(
+        config.loss, device=device, smplh_npz_path=config.smplh_npz_path
+    )
     loop_metrics_gen = training_utils.loop_metric_generator(counter_init=step)
     prev_checkpoint_path: Path | None = None
     while True:
         for train_batch in train_loader:
             loop_metrics = next(loop_metrics_gen)
             step = loop_metrics.counter
+
+            if (
+                config.num_train_steps is not None
+                and step >= config.num_train_steps
+            ):
+                accelerator.save_state(str(experiment_dir / f"checkpoints_{step}"))
+                if accelerator.is_main_process:
+                    logger.info(f"Reached num_train_steps={step}; saved final checkpoint. Done.")
+                return
 
             loss, log_outputs = loss_helper.compute_denoising_loss(
                 model,
@@ -212,10 +308,11 @@ def run_training(
                 accelerator.save_state(str(checkpoint_path))
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-                # Keep checkpoints from only every 100k steps.
+                # Keep checkpoints from every 25k steps (denser than upstream's
+                # 100k, so the best fine-tune step can be picked qualitatively).
                 if prev_checkpoint_path is not None:
                     shutil.rmtree(prev_checkpoint_path)
-                prev_checkpoint_path = None if step % 100_000 == 0 else checkpoint_path
+                prev_checkpoint_path = None if step % 25_000 == 0 else checkpoint_path
                 del checkpoint_path
 
 

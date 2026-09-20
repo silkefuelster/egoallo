@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import cache, cached_property
 from typing import Literal, assert_never
@@ -12,6 +13,7 @@ from loguru import logger
 from rotary_embedding_torch import RotaryEmbedding
 from torch import Tensor, nn
 
+from . import hand_cond as hand_cond_mod
 from .fncsmpl import SmplhModel, SmplhShapedAndPosed
 from .tensor_dataclass import TensorDataclass
 from .transforms import SE3, SO3
@@ -23,6 +25,60 @@ def project_rotmats_via_svd(
     u, s, vh = torch.linalg.svd(rotmats)
     del s
     return torch.einsum("...ij,...jk->...ik", u, vh)
+
+
+class LoRALinear(nn.Module):
+    """Wraps a (frozen) nn.Linear with a trainable low-rank update B @ A.
+
+    `lora_B` is zero-initialised, so the wrapped layer is identical to the base
+    layer at init. Used to adapt the pretrained transformer to the wrist-pose
+    conditioning while keeping the CPF backbone frozen (see `EgoDenoiserConfig`).
+    """
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: float) -> None:
+        super().__init__()
+        self.base = base
+        self.scaling = alpha / rank
+        self.lora_A = nn.Parameter(torch.empty(rank, base.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+
+
+_LORA_TARGETS: dict[str, tuple[str, ...]] = {
+    # decoder cross-attention only (how the decoder reads the conditioning).
+    "xattn": ("xattn_kv_proj", "xattn_q_proj", "xattn_out_proj"),
+    # all attention projections (encoder self-attn also carries the hand feats,
+    # since hand_cond_proj is added into encoder_out before the encoder layers).
+    "attn": (
+        "sattn_qkv_proj",
+        "sattn_out_proj",
+        "xattn_kv_proj",
+        "xattn_q_proj",
+        "xattn_out_proj",
+    ),
+    "all": (
+        "sattn_qkv_proj",
+        "sattn_out_proj",
+        "xattn_kv_proj",
+        "xattn_q_proj",
+        "xattn_out_proj",
+        "mlp0",
+        "mlp1",
+    ),
+}
+
+
+def _apply_lora(model: nn.Module, rank: int, alpha: float, targets: str) -> None:
+    """Wrap the target nn.Linear layers of every transformer block with LoRALinear."""
+    names = _LORA_TARGETS[targets]
+    for block in list(model.encoder_layers) + list(model.decoder_layers):  # type: ignore
+        for attr in names:
+            lin = getattr(block, attr, None)
+            if isinstance(lin, nn.Linear):
+                setattr(block, attr, LoRALinear(lin, rank, alpha))
 
 
 class EgoDenoiseTraj(TensorDataclass):
@@ -156,7 +212,29 @@ class EgoDenoiserConfig:
     """
 
     include_hand_positions_cond: bool = False
-    """Whether to include hand positions in the conditioning information."""
+    """Whether to include hand positions in the conditioning information.
+    Legacy / unused (kept for checkpoint compatibility); see
+    `include_wrist_pose_cond` for the first-party wrist-pose conditioning."""
+
+    include_wrist_pose_cond: bool = False
+    """First-party addition: feed observed per-hand wrist poses (position +
+    orientation, CPF frame) + a validity flag into the conditioning. 20 dims,
+    appended before the Fourier encoding. See `egoallo.hand_cond`."""
+
+    wrist_cond_encoding: hand_cond_mod.WristCondEncoding = "palm_raw"
+    """How the 10-dim per-hand block is laid out when `include_wrist_pose_cond`.
+    "rot6d": [valid, wrist_pos(3), wrist_rot6d(6)].
+    "palm_raw": [valid, wrist_pos(3), palm_vec(3), palm_normal(3)]."""
+
+    lora_rank: int = 0
+    """If > 0, wrap the transformer's attention/MLP projections with LoRA adapters
+    (rank `lora_rank`). Combined with freezing the base weights at train time,
+    this forces the wrist conditioning to be learned through a low-rank adaptation
+    instead of getting drowned out by the pretrained CPF backbone. 0 = disabled."""
+    lora_alpha: float = 16.0
+    """LoRA scaling; effective update is (alpha / rank) * B @ A."""
+    lora_targets: Literal["xattn", "attn", "all"] = "attn"
+    """Which projections to adapt: decoder cross-attn only / all attention / +MLP."""
 
     @cached_property
     def d_cond(self) -> int:
@@ -358,6 +436,24 @@ class EgoDenoiser(nn.Module):
         # Helpers for converting between input dimensionality and latent dimensionality.
         self.latent_from_cond = nn.Linear(config.d_cond, config.d_latent)
 
+        # First-party: separate, zero-initialised projection for the observed
+        # wrist-pose conditioning. Keeping it out of `latent_from_cond` means a
+        # checkpoint trained without wrist conditioning loads with no weight
+        # surgery and is reproduced exactly at fine-tune step 0.
+        self.hand_cond_proj = (
+            nn.Sequential(
+                nn.Linear(hand_cond_mod.HAND_COND_DIM, config.d_latent),
+                Activation(),
+                nn.Linear(config.d_latent, config.d_latent),
+                Activation(),
+                # zero-init the final layer -> whole MLP outputs 0 at step 0, so
+                # fine-tuning still starts identical to the released checkpoint.
+                zero_module(nn.Linear(config.d_latent, config.d_latent)),
+            )
+            if getattr(config, "include_wrist_pose_cond", False)
+            else None
+        )
+
         # Noise embedder.
         self.noise_emb = nn.Embedding(
             # index 0 will be t=1
@@ -413,6 +509,13 @@ class EgoDenoiser(nn.Module):
             ]
         )
 
+        # First-party: LoRA-adapt the transformer so the wrist conditioning can
+        # be learned without the frozen CPF backbone drowning it out.
+        if getattr(config, "lora_rank", 0) > 0:
+            _apply_lora(
+                self, config.lora_rank, config.lora_alpha, config.lora_targets
+            )
+
     def get_d_state(self) -> int:
         return EgoDenoiseTraj.get_packed_dim(self.config.include_hands)
 
@@ -424,8 +527,10 @@ class EgoDenoiser(nn.Module):
         T_world_cpf: Float[Tensor, "batch time 7"],
         T_cpf_tm1_cpf_t: Float[Tensor, "batch time 7"],
         project_output_rotmats: bool,
-        # Observed hand positions, relative to the CPF.
+        # Observed hand positions, relative to the CPF (legacy `include_hand_positions_cond`).
         hand_positions_wrt_cpf: Float[Tensor, "batch time 6"] | None,
+        # Observed per-hand wrist pose + validity, CPF frame (`include_wrist_pose_cond`).
+        hand_cond: Float[Tensor, "batch time 20"] | None = None,
         # Attention mask for using shorter sequences.
         mask: Bool[Tensor, "batch time"] | None,
         # Mask for when to drop out / keep conditioning information.
@@ -483,7 +588,19 @@ class EgoDenoiser(nn.Module):
         else:
             assert_never(config.positional_encoding)
 
-        encoder_out = self.latent_from_cond(cond) + pos_enc
+        encoder_out = self.latent_from_cond(cond)
+        if self.hand_cond_proj is not None:
+            if hand_cond is None:
+                hand_cond = cond.new_zeros(
+                    (batch, time, hand_cond_mod.HAND_COND_DIM)
+                )
+            else:
+                hand_cond = hand_cond.to(cond.dtype)
+                if cond_dropout_keep_mask is not None:
+                    hand_cond = hand_cond * cond_dropout_keep_mask[:, None, None]
+            assert hand_cond.shape == (batch, time, hand_cond_mod.HAND_COND_DIM)
+            encoder_out = encoder_out + self.hand_cond_proj(hand_cond)
+        encoder_out = encoder_out + pos_enc
         decoder_out = x_t_encoded + pos_enc
 
         # Append the noise embedding to the encoder and decoder inputs.
